@@ -1,1 +1,1 @@
-timestamp,dominant_emotion,angry,disgust,fear,happy,sad,surprise,neutral
+timestamp,dominant_emotion,angry,disgust,fear,happy,sad,surprise,neutral,blink_rate_min,gaze_offset,hr_bpm,shoulder_tilt_deg,lean_proxy,incongruence_score
