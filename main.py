@@ -24,13 +24,26 @@ Todos os sinais numericos passam por uma media movel exponencial (EMA)
 antes de aparecer na tela/log, pra reduzir tremulacao sem esconder
 tendencia real.
 
+A calibracao do baseline ('b') tambem ajusta automaticamente a
+sensibilidade de piscada (EAR) e a faixa de luz aceitavel do BPM pro seu
+rosto/ambiente, em vez de usar limiares fixos genericos.
+
 Controles:
   q - sair (mostra um resumo da sessao no terminal)
   l - liga/desliga o log da sessao (grava em session_log.csv)
   c - arquiva o log atual (session_archive/) e comeca um novo
   b - (re)inicia a calibracao do baseline (fique parado, expressao neutra)
+  n - anota/troca a nota de contexto da sessao atual (ex.: "reuniao X")
+
+Uso:
+  python main.py                     # camera/microfone padrao do sistema
+  python main.py --camera 1          # usa a webcam de indice 1
+  python main.py --mic 2             # usa o microfone de indice 2
+  python main.py --note "reuniao X"  # marca a sessao com uma nota
+  python main.py --list-devices      # lista cameras/microfones e sai
 """
 
+import argparse
 import collections
 import csv
 import os
@@ -86,8 +99,57 @@ LOG_FIELDS = [
     "blink_rate_min", "gaze_offset", "hr_bpm",
     "shoulder_tilt_deg", "lean_proxy",
     "voice_rms", "voice_pitch_hz", "voice_pause_rate_min",
-    "incongruence_score",
+    "incongruence_score", "session_note",
 ]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Analise de expressao facial e sinais complementares - uso individual e local.",
+    )
+    parser.add_argument("--camera", type=int, default=0, help="Indice da webcam (padrao: 0).")
+    parser.add_argument(
+        "--mic", type=int, default=None,
+        help="Indice do microfone (padrao: dispositivo de entrada padrao do sistema).",
+    )
+    parser.add_argument(
+        "--note", type=str, default="", metavar="TEXTO",
+        help="Nota curta de contexto pra essa sessao (ex.: 'reuniao X'), gravada em cada linha do log.",
+    )
+    parser.add_argument(
+        "--list-devices", action="store_true",
+        help="Lista as cameras e microfones disponiveis e sai, sem abrir a janela.",
+    )
+    return parser.parse_args()
+
+
+def list_devices():
+    print("Cameras disponiveis (indice: resolucao):")
+    found_camera = False
+    for i in range(6):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"  {i}: {w}x{h}")
+            found_camera = True
+        cap.release()
+    if not found_camera:
+        print("  nenhuma encontrada nos indices 0-5.")
+
+    print("\nMicrofones disponiveis (indice: nome):")
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        found_mic = False
+        for idx, dev in enumerate(devices):
+            if dev.get("max_input_channels", 0) > 0:
+                print(f"  {idx}: {dev['name']}")
+                found_mic = True
+        if not found_mic:
+            print("  nenhum microfone encontrado.")
+    except Exception as e:
+        print(f"  nao foi possivel listar microfones ({e}). Rode: pip install -r requirements.txt")
 
 
 def ensure_log_header():
@@ -119,7 +181,7 @@ def archive_current_log():
     return dest
 
 
-def log_row(dominant_emotion, scores, extra):
+def log_row(dominant_emotion, scores, extra, session_note=""):
     with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
         row = (
             [datetime.now().isoformat(timespec="seconds"), dominant_emotion]
@@ -130,6 +192,7 @@ def log_row(dominant_emotion, scores, extra):
                 "voice_rms", "voice_pitch_hz", "voice_pause_rate_min",
                 "incongruence_score",
             )]
+            + [session_note]
         )
         csv.writer(f).writerow(row)
 
@@ -144,7 +207,7 @@ PANEL_BG = (235, 235, 235)
 
 def stress_label(score):
     if score is None:
-        return "sem baseline (aperte 'b')", (90, 90, 90)
+        return "sem baseline", (90, 90, 90)
     if score < 1.0:
         return "baixo", (0, 130, 0)
     if score < 2.0:
@@ -152,7 +215,7 @@ def stress_label(score):
     return "alto", (0, 0, 200)
 
 
-def draw_overlay(frame, region, dominant_emotion, scores, logging_on, extra, calibrating, calib_remaining):
+def draw_overlay(frame, region, dominant_emotion, scores, logging_on, extra, calibrating, calib_remaining, session_note=""):
     x, y, w, h = region["x"], region["y"], region["w"], region["h"]
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 130, 0), 2)
 
@@ -185,12 +248,18 @@ def draw_overlay(frame, region, dominant_emotion, scores, logging_on, extra, cal
     color = (0, 0, 180) if logging_on else (90, 90, 90)
     cv2.putText(frame, status, (15, bar_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+    if session_note:
+        cv2.putText(
+            frame, f"Nota: {session_note}", (15, bar_y + 38),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 60, 0), 1,
+        )
+
     # --- painel de sinais complementares (canto superior direito) ---
     if not SIGNALS_AVAILABLE:
         return
 
     fh, fw = frame.shape[:2]
-    panel2_w, panel2_h = 320, 170
+    panel2_w, panel2_h = 350, 170
     px0 = fw - panel2_w - 5
     cv2.rectangle(frame, (px0, 5), (fw - 5, 5 + panel2_h), PANEL_BG, -1)
 
@@ -269,10 +338,20 @@ def print_session_summary(start_time, emotion_counts, stress_counts):
 
 
 def main():
+    args = parse_args()
+    if args.list_devices:
+        list_devices()
+        return
+
+    session_note = args.note or ""
+
     ensure_log_header()
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        raise RuntimeError("Nao foi possivel abrir a webcam.")
+        raise RuntimeError(
+            f"Nao foi possivel abrir a webcam de indice {args.camera}. "
+            f"Rode com --list-devices pra ver o que esta disponivel."
+        )
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     if fps <= 1 or fps > 120:
@@ -295,10 +374,11 @@ def main():
         except ImportError as e:
             print(f"[aviso] BPM (rPPG) desativado: {e}")
         try:
-            voice = VoiceTracker()
+            voice = VoiceTracker(device=args.mic)
             voice.start()
         except Exception as e:
-            print(f"[aviso] sinal de voz desativado ({e}). Verifique se o microfone esta disponivel/permitido.")
+            print(f"[aviso] sinal de voz desativado ({e}). Verifique se o microfone esta disponivel/permitido "
+                  f"(ou tente --list-devices pra escolher outro).")
             voice = None
 
     # suavizacao (EMA) - reduz tremulacao dos sinais na tela/log
@@ -316,6 +396,8 @@ def main():
 
     calibrating = False
     calib_end_time = 0.0
+    ear_samples = []
+    brightness_samples = []
 
     extra = {k: None for k in (*SIGNAL_KEYS, "incongruence_score", "hr_quality_note")}
 
@@ -323,7 +405,9 @@ def main():
     emotion_counts = collections.Counter()
     stress_counts = collections.Counter()
 
-    print("Pressione 'q' sair | 'l' liga/desliga log | 'c' arquiva+limpa log | 'b' calibrar baseline")
+    print("Pressione 'q' sair | 'l' liga/desliga log | 'c' arquiva+limpa log | 'b' calibrar baseline | 'n' anotar sessao")
+    if session_note:
+        print(f"Nota da sessao: {session_note}")
 
     try:
         while True:
@@ -334,11 +418,12 @@ def main():
             now = time.time()
 
             # --- sinais complementares (todo frame, sao leves) ---
-            gaze_raw = shoulder_tilt_raw = lean_proxy = None
+            gaze_raw = shoulder_tilt_raw = lean_proxy = ear_raw = None
             if face_mesh is not None:
                 fm = face_mesh.process(frame)
                 if fm is not None:
                     gaze_raw = fm["gaze_offset"]
+                    ear_raw = fm["ear"]
                     if rppg is not None:
                         rppg.add_frame(frame, fm["forehead_box"])
                     extra["blink_rate_min"] = face_mesh.blink_rate_per_min()
@@ -385,10 +470,25 @@ def main():
                 if stress_ema:
                     stress_ema.reset()
                 calibrator.add_sample(**sample_kwargs)
+                if ear_raw is not None:
+                    ear_samples.append(ear_raw)
+                if rppg is not None and rppg.last_brightness is not None:
+                    brightness_samples.append(rppg.last_brightness)
                 if now >= calib_end_time:
                     calibrating = False
                     ok_calib = calibrator.finalize()
-                    print("Baseline calibrado." if ok_calib else "Calibracao insuficiente, tente 'b' de novo.")
+                    tuned = []
+                    if face_mesh is not None and face_mesh.calibrate_blink_threshold(ear_samples):
+                        tuned.append("piscada")
+                    if rppg is not None and rppg.calibrate_lighting(brightness_samples):
+                        tuned.append("luz do BPM")
+                    ear_samples = []
+                    brightness_samples = []
+                    if ok_calib:
+                        extra_msg = f" (sensibilidade ajustada: {', '.join(tuned)})" if tuned else ""
+                        print(f"Baseline calibrado.{extra_msg}")
+                    else:
+                        print("Calibracao insuficiente, tente 'b' de novo.")
             else:
                 raw_score = compute_incongruence(calibrator, **sample_kwargs)
                 extra["incongruence_score"] = stress_ema.update(raw_score) if (stress_ema and raw_score is not None) else raw_score
@@ -411,7 +511,7 @@ def main():
                     emotion_counts[last_dominant] += 1
 
                     if logging_on and last_region["w"] > 0:
-                        log_row(last_dominant, last_scores, extra)
+                        log_row(last_dominant, last_scores, extra, session_note)
                 except Exception as e:
                     print(f"[aviso] falha na analise: {e}")
 
@@ -419,7 +519,7 @@ def main():
                 calib_remaining = max(0.0, calib_end_time - now)
                 draw_overlay(
                     frame, last_region, last_dominant, last_scores, logging_on,
-                    extra, calibrating, calib_remaining,
+                    extra, calibrating, calib_remaining, session_note,
                 )
             else:
                 cv2.putText(
@@ -446,20 +546,43 @@ def main():
                     print("Sinais complementares indisponiveis - instale mediapipe/scipy.")
                 else:
                     calibrator.reset()
+                    ear_samples = []
+                    brightness_samples = []
                     calibrating = True
                     calib_end_time = time.time() + CALIBRATION_SECONDS
                     print(f"Calibrando por {CALIBRATION_SECONDS}s - fique parado, expressao neutra.")
+            elif key == ord("n"):
+                # janela do OpenCV congela um instante enquanto espera o
+                # texto no terminal - aceitavel, so acontece quando pedido
+                print(f"Nota atual: '{session_note}'. Digite a nova nota e Enter (vazio cancela):")
+                try:
+                    new_note = input("> ").strip()
+                except EOFError:
+                    new_note = ""
+                if new_note:
+                    session_note = new_note
+                    print(f"Nota atualizada: {session_note}")
+                else:
+                    print("Nota mantida sem alteracao.")
     except KeyboardInterrupt:
         print("\n[aviso] Interrompido com Ctrl+C - prefira apertar 'q' com a janela em foco pra sair.")
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        if face_mesh is not None:
-            face_mesh.close()
-        if pose_tracker is not None:
-            pose_tracker.close()
-        if voice is not None:
-            voice.close()
+        # um segundo Ctrl+C durante a propria limpeza nao pode derrubar o
+        # resumo da sessao nem impedir os outros recursos de fechar -
+        # cada passo e isolado e best-effort
+        for cleanup in (
+            cap.release,
+            cv2.destroyAllWindows,
+            face_mesh.close if face_mesh is not None else None,
+            pose_tracker.close if pose_tracker is not None else None,
+            voice.close if voice is not None else None,
+        ):
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except BaseException:
+                pass
         print_session_summary(session_start, emotion_counts, stress_counts)
 
 

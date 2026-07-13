@@ -73,6 +73,20 @@ def main():
     daily["emocao_mais_comum"] = df.groupby("date")["dominant_emotion"].agg(
         lambda s: s.mode().iat[0] if not s.mode().empty else None
     )
+
+    has_notes = "session_note" in df.columns
+
+    def _unique_notes(s):
+        seen = []
+        for v in s.dropna():
+            v = str(v).strip()
+            if v and v not in seen:
+                seen.append(v)
+        return "; ".join(seen)
+
+    if has_notes:
+        daily["notas"] = df.groupby("date")["session_note"].agg(_unique_notes)
+
     daily = daily.reset_index()
 
     if len(daily) < 2:
@@ -113,11 +127,14 @@ def main():
     for _, row in daily.iterrows():
         emo = EMOTION_LABELS_PT.get(row["emocao_mais_comum"], row["emocao_mais_comum"])
         if has_score and pd.notna(row.get("incongruence_score")):
-            print(f"{row['date']}: {row['n_amostras']} amostras, emocao mais comum = {emo}, "
-                  f"estresse medio = {row['incongruence_score']:.2f}")
+            line = (f"{row['date']}: {row['n_amostras']} amostras, emocao mais comum = {emo}, "
+                    f"estresse medio = {row['incongruence_score']:.2f}")
         else:
-            print(f"{row['date']}: {row['n_amostras']} amostras, emocao mais comum = {emo}, "
-                  f"sem baseline calibrado nesse dia")
+            line = (f"{row['date']}: {row['n_amostras']} amostras, emocao mais comum = {emo}, "
+                    f"sem baseline calibrado nesse dia")
+        if has_notes and row.get("notas"):
+            line += f" | notas: {row['notas']}"
+        print(line)
 
     plt.show()
 

@@ -1,1 +1,1 @@
-timestamp,dominant_emotion,angry,disgust,fear,happy,sad,surprise,neutral,blink_rate_min,gaze_offset,hr_bpm,shoulder_tilt_deg,lean_proxy,voice_rms,voice_pitch_hz,voice_pause_rate_min,incongruence_score
+timestamp,dominant_emotion,angry,disgust,fear,happy,sad,surprise,neutral,blink_rate_min,gaze_offset,hr_bpm,shoulder_tilt_deg,lean_proxy,voice_rms,voice_pitch_hz,voice_pause_rate_min,incongruence_score,session_note

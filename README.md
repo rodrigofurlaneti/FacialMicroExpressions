@@ -111,7 +111,33 @@ python main.py
   depois com `trends.py`)
 - `b` — (re)inicia a calibração do baseline: fique ~12s parado, com
   expressão neutra, olhando pra câmera. Sem isso, o score de
-  incongruência não aparece (mostra "sem baseline").
+  incongruência não aparece (mostra "sem baseline"). A calibração também
+  **ajusta automaticamente** a sensibilidade de piscada (EAR) e a faixa
+  de luz aceitável do BPM pro seu rosto/ambiente, em vez de usar
+  limiares fixos genéricos.
+- `n` — anota/troca uma nota curta de contexto pra sessão atual (ex.:
+  "reunião X"), digitada no terminal — fica gravada em cada linha do log
+  e aparece resumida no `trends.py`, pra você ver em que tipo de
+  situação seu estresse mudou. A janela fica parada por um instante
+  enquanto espera você digitar, é esperado.
+
+### Câmera e microfone
+
+Por padrão usa os dispositivos padrão do sistema. Pra escolher outros:
+
+```
+python main.py --list-devices       # lista cameras/microfones disponiveis
+python main.py --camera 1 --mic 2   # usa webcam de indice 1, mic de indice 2
+python main.py --note "reuniao X"   # marca a sessao com uma nota desde o inicio
+```
+
+No Windows, se um índice de microfone específico der `PaErrorCode -9996
+(Invalid device)`, o `VoiceTracker` já tenta de novo automaticamente com
+a taxa de amostragem nativa daquele dispositivo antes de desistir — é
+comum um mesmo microfone físico aparecer em vários índices (MME,
+DirectSound, WASAPI, WDM-KS) e nem todos aceitarem 16kHz forçado. Se
+mesmo assim continuar falhando, tenta outro índice do mesmo microfone
+listado em `--list-devices`.
 
 Depois de uma sessão com log ativado, gere um relatório pessoal:
 
@@ -137,6 +163,22 @@ Isso junta o `session_log.csv` atual com tudo que estiver em
 `session_log.csv`, `session_archive/` e os `.png` de relatório **não são
 versionados** (estão no `.gitignore`) porque são dados pessoais — mantenha
 assim, especialmente se este repositório for público.
+
+## Testes
+
+```
+python -m unittest test_signals -v
+```
+
+Cobre a matemática por trás de cada sinal com dados sintéticos (EMA, EAR
+de piscada, desvio de olhar, z-score do baseline, recuperação de BPM a
+partir de um sinal senoidal de frequência conhecida, estimativa de pitch
+por autocorrelação) — sem precisar de webcam/microfone/mediapipe reais
+rodando. Testes que dependem de `scipy` ou `sounddevice` são pulados
+automaticamente (não falham) se esses pacotes não estiverem instalados
+no ambiente. **Não coberto** (exigiria hardware/integração real):
+`FaceMeshTracker.process`, `PoseTracker.process` e a captura de áudio de
+verdade do `VoiceTracker` — só a lógica pura de cada um está testada.
 
 ## Build (.exe standalone)
 

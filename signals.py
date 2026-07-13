@@ -109,6 +109,26 @@ def _eye_aspect_ratio(pts, idx):
     return (vert1 + vert2) / (2.0 * horiz)
 
 
+def _compute_gaze_offset(pts):
+    """~0 = olhando pro centro do proprio olho; valores maiores = iris
+    desviada pra lateral (proxy grosseiro de desviar o olhar). Funcao de
+    modulo (nao depende de mediapipe em si, so dos pontos ja extraidos)
+    pra dar pra testar sem precisar de uma FaceMeshTracker de verdade."""
+    offsets = []
+    for iris_idx, corners in (
+        (LEFT_IRIS, LEFT_EYE_CORNERS),
+        (RIGHT_IRIS, RIGHT_EYE_CORNERS),
+    ):
+        iris_center = pts[iris_idx].mean(axis=0)
+        c0, c1 = pts[corners[0]], pts[corners[1]]
+        eye_center = (c0 + c1) / 2.0
+        eye_width = np.linalg.norm(c1 - c0)
+        if eye_width == 0:
+            continue
+        offsets.append(np.linalg.norm(iris_center - eye_center) / eye_width)
+    return float(np.mean(offsets)) if offsets else 0.0
+
+
 class FaceMeshTracker:
     """Extrai piscadas e desvio de olhar (gaze) por frame, mais a caixa
     da testa (usada pelo RPPGEstimator)."""
@@ -152,7 +172,7 @@ class FaceMeshTracker:
                 self.blink_timestamps.append(time.time())
             self._closed_frames = 0
 
-        gaze_offset = self._gaze_offset(pts)
+        gaze_offset = _compute_gaze_offset(pts)
 
         forehead_pts = pts[FOREHEAD_REGION]
         x0, y0 = forehead_pts.min(axis=0)
@@ -166,27 +186,23 @@ class FaceMeshTracker:
             "forehead_box": forehead_box,
         }
 
-    def _gaze_offset(self, pts):
-        """~0 = olhando pro centro do proprio olho; valores maiores =
-        iris desviada pra lateral (proxy grosseiro de desviar o olhar)."""
-        offsets = []
-        for iris_idx, corners in (
-            (LEFT_IRIS, LEFT_EYE_CORNERS),
-            (RIGHT_IRIS, RIGHT_EYE_CORNERS),
-        ):
-            iris_center = pts[iris_idx].mean(axis=0)
-            c0, c1 = pts[corners[0]], pts[corners[1]]
-            eye_center = (c0 + c1) / 2.0
-            eye_width = np.linalg.norm(c1 - c0)
-            if eye_width == 0:
-                continue
-            offsets.append(np.linalg.norm(iris_center - eye_center) / eye_width)
-        return float(np.mean(offsets)) if offsets else 0.0
-
     def blink_rate_per_min(self, window_s=60):
         now = time.time()
         recent = [t for t in self.blink_timestamps if now - t <= window_s]
         return len(recent) * (60.0 / window_s)
+
+    def calibrate_blink_threshold(self, ear_samples):
+        """Ajusta o limiar de piscada pro rosto/camera dessa pessoa, a
+        partir de amostras de EAR coletadas durante a calibracao do
+        baseline (a maioria com olho aberto, algumas piscadas raras).
+        Usa a mediana (resistente as poucas piscadas na amostra) com uma
+        margem, em vez do valor fixo generico. Retorna False se nao tinha
+        amostra suficiente (mantem o limiar padrao)."""
+        if len(ear_samples) < 10:
+            return False
+        open_estimate = float(np.median(ear_samples))
+        self.EAR_BLINK_THRESHOLD = max(0.05, open_estimate * 0.75)
+        return True
 
     def close(self):
         self._mesh.close()
@@ -222,6 +238,7 @@ class RPPGEstimator:
         self._last_bpm = None
         self._last_quality = 0.0
         self._last_box_center = None
+        self.last_brightness = None
         self.lighting_ok = True
         self.motion_ok = True
 
@@ -242,6 +259,7 @@ class RPPGEstimator:
         self._last_box_center = center
 
         brightness = float(np.mean(roi))
+        self.last_brightness = brightness
         self.lighting_ok = self.MIN_BRIGHTNESS < brightness < self.MAX_BRIGHTNESS
 
         # canal verde tem melhor relacao sinal/ruido para variacao de
@@ -284,6 +302,20 @@ class RPPGEstimator:
         """False = leitura de BPM nao deve ser mostrada/usada no baseline
         (pouca luz, muito movimento, ou pico espectral fraco/ambiguo)."""
         return self.lighting_ok and self.motion_ok and self._last_quality >= self.MIN_QUALITY
+
+    def calibrate_lighting(self, brightness_samples):
+        """Ajusta a faixa de brilho aceitavel pro ambiente real da
+        pessoa (webcam/luz variam muito), em vez dos limites fixos
+        genericos. Usa percentis 5-95 da calibracao com uma margem, pra
+        nao ficar refem de 1-2 amostras extremas. Retorna False se nao
+        tinha amostra suficiente (mantem os limites padrao)."""
+        if len(brightness_samples) < 10:
+            return False
+        lo, hi = np.percentile(brightness_samples, [5, 95])
+        margin = max(10.0, (hi - lo) * 0.5)
+        self.MIN_BRIGHTNESS = max(10.0, float(lo - margin))
+        self.MAX_BRIGHTNESS = min(245.0, float(hi + margin))
+        return True
 
 
 class PoseTracker:
@@ -352,14 +384,16 @@ class VoiceTracker:
     PITCH_MIN_HZ = 70
     PITCH_MAX_HZ = 400
 
-    def __init__(self, samplerate=16000, block_seconds=0.5):
+    def __init__(self, samplerate=16000, block_seconds=0.5, device=None):
         if sd is None:
             raise ImportError(
                 f"sounddevice nao pode ser importado ({_SD_IMPORT_ERROR!r}). "
                 f"Rode: pip install -r requirements.txt"
             )
+        self.block_seconds = block_seconds
         self.samplerate = samplerate
         self.block_size = int(samplerate * block_seconds)
+        self.device = device  # indice do microfone, ou None = padrao do sistema
 
         self._lock = threading.Lock()
         self._latest = {"rms": None, "pitch_hz": None, "is_silent": True}
@@ -368,11 +402,33 @@ class VoiceTracker:
         self._stream = None
 
     def start(self):
+        try:
+            self._open_stream()
+        except Exception:
+            # alguns drivers/dispositivos (comum no Windows com WASAPI)
+            # recusam a taxa de amostragem pedida (16kHz) com "Invalid
+            # device" - tenta de novo uma vez com a taxa nativa do
+            # proprio dispositivo antes de desistir
+            native_rate = self._query_native_samplerate()
+            if not native_rate or native_rate == self.samplerate:
+                raise
+            self.samplerate = native_rate
+            self.block_size = int(native_rate * self.block_seconds)
+            self._open_stream()
+
+    def _open_stream(self):
         self._stream = sd.InputStream(
             samplerate=self.samplerate, channels=1, blocksize=self.block_size,
-            callback=self._callback,
+            device=self.device, callback=self._callback,
         )
         self._stream.start()
+
+    def _query_native_samplerate(self):
+        try:
+            info = sd.query_devices(self.device)
+            return int(round(info.get("default_samplerate") or 0))
+        except Exception:
+            return 0
 
     def _callback(self, indata, frames, time_info, status):
         audio = np.asarray(indata[:, 0], dtype=np.float64)
