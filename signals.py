@@ -20,9 +20,12 @@ Referencias de metodo:
   iris do MediaPipe Face Mesh (refine_landmarks=True).
 - Postura: angulo de inclinacao dos ombros e distancia ombro-nariz (proxy
   de inclinar o tronco pra frente/tras), via MediaPipe Pose.
+- Voz: volume (RMS), taxa de pausas na fala e pitch aproximado por
+  autocorrelacao, via microfone (sounddevice). Audio bruto nunca e salvo.
 """
 
 import collections
+import threading
 import time
 
 import numpy as np
@@ -41,6 +44,35 @@ try:
 except Exception as e:
     butter = filtfilt = None
     _SCIPY_IMPORT_ERROR = e
+
+try:
+    import sounddevice as sd
+    _SD_IMPORT_ERROR = None
+except Exception as e:
+    sd = None
+    _SD_IMPORT_ERROR = e
+
+
+class EMA:
+    """Media movel exponencial simples, usada pra suavizar sinais
+    ruidosos (gaze, BPM, inclinacao dos ombros, score de incongruencia)
+    antes de exibir/logar - reduz flicker sem esconder tendencia real."""
+
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, x):
+        if x is None:
+            return self.value
+        if self.value is None:
+            self.value = float(x)
+        else:
+            self.value = self.alpha * float(x) + (1 - self.alpha) * self.value
+        return self.value
+
+    def reset(self):
+        self.value = None
 
 
 # --- Indices do MediaPipe Face Mesh (468 pontos + 10 de iris quando
@@ -168,6 +200,14 @@ class RPPGEstimator:
     substitui um oximetro/monitor cardiaco de verdade.
     """
 
+    # limiares empiricos, grosseiros de proposito - o objetivo e so
+    # descartar leituras obviamente ruins (escuro demais, estourado de
+    # luz, cabeca se mexendo muito), nao validar precisao clinica
+    MIN_BRIGHTNESS = 25
+    MAX_BRIGHTNESS = 230
+    MAX_MOTION_RATIO = 0.15  # deslocamento do centro da testa vs largura dela
+    MIN_QUALITY = 0.15  # fracao da energia do espectro concentrada no pico
+
     def __init__(self, fps=30, buffer_seconds=8, hr_min=42, hr_max=180):
         if butter is None:
             raise ImportError(
@@ -180,15 +220,30 @@ class RPPGEstimator:
         self.hr_min = hr_min
         self.hr_max = hr_max
         self._last_bpm = None
+        self._last_quality = 0.0
+        self._last_box_center = None
+        self.lighting_ok = True
+        self.motion_ok = True
 
     def add_frame(self, frame_bgr, forehead_box):
         x, y, w, h = forehead_box
         if w <= 0 or h <= 0:
+            self.motion_ok = False
             return
         x, y = max(x, 0), max(y, 0)
         roi = frame_bgr[y:y + h, x:x + w]
         if roi.size == 0:
             return
+
+        center = (x + w / 2.0, y + h / 2.0)
+        if self._last_box_center is not None:
+            disp = np.hypot(center[0] - self._last_box_center[0], center[1] - self._last_box_center[1])
+            self.motion_ok = disp < (w * self.MAX_MOTION_RATIO)
+        self._last_box_center = center
+
+        brightness = float(np.mean(roi))
+        self.lighting_ok = self.MIN_BRIGHTNESS < brightness < self.MAX_BRIGHTNESS
+
         # canal verde tem melhor relacao sinal/ruido para variacao de
         # volume sanguineo na pele
         self.buffer.append(float(np.mean(roi[:, :, 1])))
@@ -216,9 +271,19 @@ class RPPGEstimator:
         if not np.any(band):
             return self._last_bpm
 
-        peak_freq = freqs[band][np.argmax(power[band])]
+        band_power = power[band]
+        peak_idx = int(np.argmax(band_power))
+        peak_freq = freqs[band][peak_idx]
+        total = float(np.sum(band_power)) + 1e-9
+        self._last_quality = float(band_power[peak_idx]) / total
+
         self._last_bpm = float(peak_freq * 60.0)
         return self._last_bpm
+
+    def is_reliable(self):
+        """False = leitura de BPM nao deve ser mostrada/usada no baseline
+        (pouca luz, muito movimento, ou pico espectral fraco/ambiguo)."""
+        return self.lighting_ok and self.motion_ok and self._last_quality >= self.MIN_QUALITY
 
 
 class PoseTracker:
@@ -269,6 +334,92 @@ class PoseTracker:
 
     def close(self):
         self._pose.close()
+
+
+class VoiceTracker:
+    """
+    Sinal de voz complementar via microfone: volume (RMS), taxa de pausas
+    na fala e um pitch aproximado (autocorrelacao simples - nao e um
+    detector de pitch de qualidade musical, so uma tendencia). Roda a
+    captura numa thread separada (callback do sounddevice); process()
+    so le o ultimo estado calculado, sem bloquear o loop de video.
+
+    Audio bruto NUNCA e salvo em disco - so os valores derivados (rms,
+    pitch, pausa) entram no log, do mesmo jeito que os outros sinais.
+    """
+
+    SILENCE_RMS = 0.01
+    PITCH_MIN_HZ = 70
+    PITCH_MAX_HZ = 400
+
+    def __init__(self, samplerate=16000, block_seconds=0.5):
+        if sd is None:
+            raise ImportError(
+                f"sounddevice nao pode ser importado ({_SD_IMPORT_ERROR!r}). "
+                f"Rode: pip install -r requirements.txt"
+            )
+        self.samplerate = samplerate
+        self.block_size = int(samplerate * block_seconds)
+
+        self._lock = threading.Lock()
+        self._latest = {"rms": None, "pitch_hz": None, "is_silent": True}
+        self._pause_timestamps = collections.deque(maxlen=300)
+        self._was_silent = True
+        self._stream = None
+
+    def start(self):
+        self._stream = sd.InputStream(
+            samplerate=self.samplerate, channels=1, blocksize=self.block_size,
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def _callback(self, indata, frames, time_info, status):
+        audio = np.asarray(indata[:, 0], dtype=np.float64)
+        rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+        is_silent = rms < self.SILENCE_RMS
+
+        pitch_hz = None if is_silent else self._estimate_pitch(audio)
+
+        with self._lock:
+            self._latest = {"rms": rms, "pitch_hz": pitch_hz, "is_silent": is_silent}
+            if is_silent and not self._was_silent:
+                self._pause_timestamps.append(time.time())
+            self._was_silent = is_silent
+
+    def _estimate_pitch(self, audio):
+        audio = audio - np.mean(audio)
+        corr = np.correlate(audio, audio, mode="full")
+        corr = corr[len(corr) // 2:]
+
+        min_lag = int(self.samplerate / self.PITCH_MAX_HZ)
+        max_lag = int(self.samplerate / self.PITCH_MIN_HZ)
+        if max_lag >= len(corr) or min_lag >= max_lag:
+            return None
+
+        segment = corr[min_lag:max_lag]
+        if segment.size == 0 or np.max(segment) <= 0:
+            return None
+
+        peak_lag = min_lag + int(np.argmax(segment))
+        if peak_lag == 0:
+            return None
+        return float(self.samplerate / peak_lag)
+
+    def read(self):
+        with self._lock:
+            return dict(self._latest)
+
+    def pause_rate_per_min(self, window_s=60):
+        now = time.time()
+        recent = [t for t in self._pause_timestamps if now - t <= window_s]
+        return len(recent) * (60.0 / window_s)
+
+    def close(self):
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
 
 class BaselineCalibrator:

@@ -1,0 +1,8 @@
+# Dependencias so pra gerar o executavel standalone (build), nao pra
+# rodar o projeto a partir do codigo-fonte - essas ficam em requirements.txt.
+#
+# Uso: pip install -r requirements.txt -r requirements-build.txt
+#      pyinstaller main.spec
+
+pyinstaller==6.11.1
+pyinstaller-hooks-contrib==2024.10

@@ -1,31 +1,40 @@
 """
 Analise de expressao facial em tempo real - uso individual e local.
 
-Este script roda 100% na sua maquina: nenhuma imagem ou dado sai do
-computador. O objetivo e autoconhecimento (ver seu proprio padrao de
+Este script roda 100% na sua maquina: nenhuma imagem, audio ou dado sai
+do computador. O objetivo e autoconhecimento (ver seu proprio padrao de
 humor/estresse ao longo de uma sessao), nao vigilancia, ranking de
 terceiros ou deteccao de mentira. Veja o README para o porque disso.
 
 Sinais capturados:
   - Emocao dominante (DeepFace): macro-expressoes.
   - Piscadas e desvio de olhar (MediaPipe Face Mesh).
-  - Frequencia cardiaca aproximada via rPPG (MediaPipe + testa).
+  - Frequencia cardiaca aproximada via rPPG (MediaPipe + testa), com
+    checagem de qualidade (luz/movimento) - BPM some da tela quando a
+    leitura nao e confiavel em vez de mostrar um numero enganoso.
   - Postura: inclinacao dos ombros e proxy de inclinar o tronco
     (MediaPipe Pose).
+  - Voz: volume, taxa de pausas na fala e pitch aproximado (microfone).
+    Audio bruto nunca e salvo, so os valores derivados.
   - Um "score de incongruencia/estresse", que so existe DEPOIS de
     calibrar seu proprio baseline neutro (tecla 'b'). Ele mede o quanto
     voce se afastou do SEU proprio normal - nao indica mentira.
 
+Todos os sinais numericos passam por uma media movel exponencial (EMA)
+antes de aparecer na tela/log, pra reduzir tremulacao sem esconder
+tendencia real.
+
 Controles:
-  q - sair
+  q - sair (mostra um resumo da sessao no terminal)
   l - liga/desliga o log da sessao (grava em session_log.csv)
-  c - limpa o log atual
+  c - arquiva o log atual (session_archive/) e comeca um novo
   b - (re)inicia a calibracao do baseline (fique parado, expressao neutra)
 """
 
 import collections
 import csv
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -33,14 +42,24 @@ import cv2
 from deepface import DeepFace
 
 try:
-    from signals import BaselineCalibrator, FaceMeshTracker, PoseTracker, RPPGEstimator
+    from signals import (
+        BaselineCalibrator, EMA, FaceMeshTracker, PoseTracker, RPPGEstimator, VoiceTracker,
+    )
     SIGNALS_AVAILABLE = True
 except ImportError as e:
     print(f"[aviso] sinais complementares desativados ({e}). "
           f"Rode: pip install -r requirements.txt")
     SIGNALS_AVAILABLE = False
 
-LOG_PATH = os.path.join(os.path.dirname(__file__), "session_log.csv")
+# Rodando como .exe (PyInstaller), __file__ aponta pra dentro do bundle,
+# nao pra pasta ao lado do executavel - usa sys.executable nesse caso, pra
+# session_log.csv/session_archive ficarem num lugar previsivel e gravavel.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(BASE_DIR, "session_log.csv")
+ARCHIVE_DIR = os.path.join(BASE_DIR, "session_archive")
 ANALYZE_EVERY_N_FRAMES = 5  # DeepFace e pesado; nao roda a cada frame
 CALIBRATION_SECONDS = 12
 EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
@@ -55,10 +74,19 @@ EMOTION_LABELS_PT = {
     "neutral": "neutro",
 }
 
+# chaves dos sinais complementares que entram no baseline/z-score - uma
+# unica lista pra nao duplicar (e desalinhar) entre calibracao e leitura
+SIGNAL_KEYS = [
+    "gaze_offset", "hr_bpm", "shoulder_tilt_deg", "lean_proxy", "blink_rate_min",
+    "voice_rms", "voice_pitch_hz", "voice_pause_rate_min",
+]
+
 LOG_FIELDS = [
     "timestamp", "dominant_emotion", *EMOTIONS,
     "blink_rate_min", "gaze_offset", "hr_bpm",
-    "shoulder_tilt_deg", "lean_proxy", "incongruence_score",
+    "shoulder_tilt_deg", "lean_proxy",
+    "voice_rms", "voice_pitch_hz", "voice_pause_rate_min",
+    "incongruence_score",
 ]
 
 
@@ -73,19 +101,35 @@ def write_log_header_now():
         csv.writer(f).writerow(LOG_FIELDS)
 
 
+def archive_current_log():
+    """Move o session_log.csv atual pra session_archive/ com timestamp no
+    nome, em vez de destruir os dados - assim trends.py consegue comparar
+    sessoes antigas. So arquiva se tiver dado de verdade (mais que so o
+    cabecalho)."""
+    if not os.path.exists(LOG_PATH):
+        return None
+    with open(LOG_PATH, encoding="utf-8") as f:
+        has_data = len(f.readlines()) > 1
+    if not has_data:
+        return None
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(ARCHIVE_DIR, f"session_{stamp}.csv")
+    os.replace(LOG_PATH, dest)
+    return dest
+
+
 def log_row(dominant_emotion, scores, extra):
     with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
         row = (
             [datetime.now().isoformat(timespec="seconds"), dominant_emotion]
             + [round(scores.get(e, 0.0), 2) for e in EMOTIONS]
-            + [
-                _fmt(extra.get("blink_rate_min")),
-                _fmt(extra.get("gaze_offset")),
-                _fmt(extra.get("hr_bpm")),
-                _fmt(extra.get("shoulder_tilt_deg")),
-                _fmt(extra.get("lean_proxy")),
-                _fmt(extra.get("incongruence_score")),
-            ]
+            + [_fmt(extra.get(k)) for k in (
+                "blink_rate_min", "gaze_offset", "hr_bpm",
+                "shoulder_tilt_deg", "lean_proxy",
+                "voice_rms", "voice_pitch_hz", "voice_pause_rate_min",
+                "incongruence_score",
+            )]
         )
         csv.writer(f).writerow(row)
 
@@ -146,7 +190,7 @@ def draw_overlay(frame, region, dominant_emotion, scores, logging_on, extra, cal
         return
 
     fh, fw = frame.shape[:2]
-    panel2_w, panel2_h = 300, 120
+    panel2_w, panel2_h = 320, 170
     px0 = fw - panel2_w - 5
     cv2.rectangle(frame, (px0, 5), (fw - 5, 5 + panel2_h), PANEL_BG, -1)
 
@@ -163,20 +207,30 @@ def draw_overlay(frame, region, dominant_emotion, scores, logging_on, extra, cal
         return
 
     def line(text, dy):
-        cv2.putText(frame, text, (px0 + 10, ty + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.48, TEXT_DARK, 1)
+        cv2.putText(frame, text, (px0 + 10, ty + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.46, TEXT_DARK, 1)
 
     hr = extra.get("hr_bpm")
-    line(f"BPM (aprox.): {hr:.0f}" if hr else "BPM (aprox.): --", 0)
+    hr_note = extra.get("hr_quality_note")
+    if hr is not None:
+        line(f"BPM (aprox.): {hr:.0f}", 0)
+    else:
+        line(f"BPM (aprox.): -- ({hr_note})" if hr_note else "BPM (aprox.): --", 0)
+
     blink = extra.get("blink_rate_min")
-    line(f"Piscadas/min: {blink:.0f}" if blink is not None else "Piscadas/min: --", 22)
+    line(f"Piscadas/min: {blink:.0f}" if blink is not None else "Piscadas/min: --", 21)
     gaze = extra.get("gaze_offset")
-    line(f"Desvio de olhar: {gaze:.2f}" if gaze is not None else "Desvio de olhar: --", 44)
+    line(f"Desvio de olhar: {gaze:.2f}" if gaze is not None else "Desvio de olhar: --", 42)
     tilt = extra.get("shoulder_tilt_deg")
-    line(f"Inclinacao ombros: {tilt:.1f}graus" if tilt is not None else "Inclinacao ombros: --", 66)
+    line(f"Inclinacao ombros: {tilt:.1f}graus" if tilt is not None else "Inclinacao ombros: --", 63)
+
+    pause = extra.get("voice_pause_rate_min")
+    line(f"Pausas na fala/min: {pause:.0f}" if pause is not None else "Pausas na fala/min: --", 84)
+    pitch = extra.get("voice_pitch_hz")
+    line(f"Pitch da voz (aprox.): {pitch:.0f}Hz" if pitch is not None else "Pitch da voz (aprox.): --", 105)
 
     score = extra.get("incongruence_score")
     txt, color = stress_label(score)
-    line(f"Sinal de estresse: {txt}", 90)
+    line(f"Sinal de estresse: {txt}", 130)
 
 
 def compute_incongruence(calibrator, **signals):
@@ -189,6 +243,31 @@ def compute_incongruence(calibrator, **signals):
     return sum(clipped) / len(clipped)
 
 
+def print_session_summary(start_time, emotion_counts, stress_counts):
+    duration_s = time.time() - start_time
+    mins, secs = divmod(int(duration_s), 60)
+
+    print("\n--- Resumo da sessao ---")
+    print(f"Duracao: {mins}min {secs}s")
+
+    total_e = sum(emotion_counts.values())
+    if total_e:
+        print("Emocao dominante (por amostra do DeepFace):")
+        for emo, cnt in emotion_counts.most_common():
+            print(f"  {EMOTION_LABELS_PT.get(emo, emo)}: {100 * cnt / total_e:.0f}%")
+
+    total_s = sum(stress_counts.values())
+    if total_s:
+        print("Sinal de estresse (apos calibrar baseline com 'b'):")
+        for lbl in ("baixo", "medio", "alto"):
+            if lbl in stress_counts:
+                print(f"  {lbl}: {100 * stress_counts[lbl] / total_s:.0f}% do tempo com baseline calibrado")
+    else:
+        print("Baseline nao calibrado nesta sessao - aperte 'b' na proxima pra ter esse dado.")
+    print("Lembrete: isto e sinal de estresse/incongruencia pra autoconhecimento, nao deteccao de mentira.")
+    print("------------------------\n")
+
+
 def main():
     ensure_log_header()
     cap = cv2.VideoCapture(0)
@@ -199,15 +278,35 @@ def main():
     if fps <= 1 or fps > 120:
         fps = 30
 
-    face_mesh = pose_tracker = rppg = calibrator = None
+    calibrator = BaselineCalibrator() if SIGNALS_AVAILABLE else None
+
+    face_mesh = pose_tracker = rppg = voice = None
     if SIGNALS_AVAILABLE:
         try:
             face_mesh = FaceMeshTracker()
-            pose_tracker = PoseTracker()
-            rppg = RPPGEstimator(fps=fps)
-            calibrator = BaselineCalibrator()
         except ImportError as e:
-            print(f"[aviso] nao foi possivel iniciar sinais complementares: {e}")
+            print(f"[aviso] piscadas/desvio de olhar desativados: {e}")
+        try:
+            pose_tracker = PoseTracker()
+        except ImportError as e:
+            print(f"[aviso] postura desativada: {e}")
+        try:
+            rppg = RPPGEstimator(fps=fps)
+        except ImportError as e:
+            print(f"[aviso] BPM (rPPG) desativado: {e}")
+        try:
+            voice = VoiceTracker()
+            voice.start()
+        except Exception as e:
+            print(f"[aviso] sinal de voz desativado ({e}). Verifique se o microfone esta disponivel/permitido.")
+            voice = None
+
+    # suavizacao (EMA) - reduz tremulacao dos sinais na tela/log
+    gaze_ema = EMA(alpha=0.3) if SIGNALS_AVAILABLE else None
+    tilt_ema = EMA(alpha=0.3) if SIGNALS_AVAILABLE else None
+    hr_ema = EMA(alpha=0.2) if SIGNALS_AVAILABLE else None
+    pitch_ema = EMA(alpha=0.3) if SIGNALS_AVAILABLE else None
+    stress_ema = EMA(alpha=0.25) if SIGNALS_AVAILABLE else None
 
     frame_count = 0
     last_region = None
@@ -218,119 +317,150 @@ def main():
     calibrating = False
     calib_end_time = 0.0
 
-    emotion_history = collections.deque(maxlen=200)  # (timestamp, dominant_emotion)
-    extra = {
-        "blink_rate_min": None, "gaze_offset": None, "hr_bpm": None,
-        "shoulder_tilt_deg": None, "lean_proxy": None, "incongruence_score": None,
-    }
+    extra = {k: None for k in (*SIGNAL_KEYS, "incongruence_score", "hr_quality_note")}
 
-    print("Pressione 'q' sair | 'l' liga/desliga log | 'c' limpa log | 'b' calibrar baseline")
+    session_start = time.time()
+    emotion_counts = collections.Counter()
+    stress_counts = collections.Counter()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    print("Pressione 'q' sair | 'l' liga/desliga log | 'c' arquiva+limpa log | 'b' calibrar baseline")
 
-        now = time.time()
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        # --- sinais complementares (todo frame, sao leves) ---
-        gaze_offset = shoulder_tilt = lean_proxy = None
-        if face_mesh is not None:
-            fm = face_mesh.process(frame)
-            if fm is not None:
-                gaze_offset = fm["gaze_offset"]
-                if rppg is not None:
-                    rppg.add_frame(frame, fm["forehead_box"])
-                extra["blink_rate_min"] = face_mesh.blink_rate_per_min()
+            now = time.time()
 
-        if pose_tracker is not None:
-            pr = pose_tracker.process(frame)
-            if pr is not None:
-                shoulder_tilt = pr["shoulder_tilt_deg"]
-                lean_proxy = pr["lean_proxy"]
+            # --- sinais complementares (todo frame, sao leves) ---
+            gaze_raw = shoulder_tilt_raw = lean_proxy = None
+            if face_mesh is not None:
+                fm = face_mesh.process(frame)
+                if fm is not None:
+                    gaze_raw = fm["gaze_offset"]
+                    if rppg is not None:
+                        rppg.add_frame(frame, fm["forehead_box"])
+                    extra["blink_rate_min"] = face_mesh.blink_rate_per_min()
 
-        hr_bpm = rppg.estimate_bpm() if rppg is not None else None
-        extra["gaze_offset"] = gaze_offset
-        extra["hr_bpm"] = hr_bpm
-        extra["shoulder_tilt_deg"] = shoulder_tilt
-        extra["lean_proxy"] = lean_proxy
+            if pose_tracker is not None:
+                pr = pose_tracker.process(frame)
+                if pr is not None:
+                    shoulder_tilt_raw = pr["shoulder_tilt_deg"]
+                    lean_proxy = pr["lean_proxy"]
 
-        if calibrating:
-            extra["incongruence_score"] = None
-            calibrator.add_sample(
-                gaze_offset=gaze_offset, hr_bpm=hr_bpm,
-                shoulder_tilt_deg=shoulder_tilt, lean_proxy=lean_proxy,
-                blink_rate_min=extra["blink_rate_min"],
-            )
-            if now >= calib_end_time:
-                calibrating = False
-                ok_calib = calibrator.finalize()
-                print("Baseline calibrado." if ok_calib else "Calibracao insuficiente, tente 'b' de novo.")
-        else:
-            extra["incongruence_score"] = compute_incongruence(
-                calibrator,
-                gaze_offset=gaze_offset, hr_bpm=hr_bpm,
-                shoulder_tilt_deg=shoulder_tilt, lean_proxy=lean_proxy,
-                blink_rate_min=extra["blink_rate_min"],
-            )
+            hr_reliable = False
+            hr_raw = None
+            if rppg is not None:
+                hr_raw = rppg.estimate_bpm()
+                hr_reliable = rppg.is_reliable()
+                if not hr_reliable:
+                    extra["hr_quality_note"] = (
+                        "pouca luz" if not rppg.lighting_ok else
+                        "movimento" if not rppg.motion_ok else
+                        "sinal fraco"
+                    )
+                else:
+                    extra["hr_quality_note"] = None
 
-        # --- emocao (DeepFace, mais pesado, roda a cada N frames) ---
-        frame_count += 1
-        if frame_count % ANALYZE_EVERY_N_FRAMES == 0:
-            try:
-                result = DeepFace.analyze(
-                    frame, actions=["emotion"], enforce_detection=False, silent=True
-                )
-                if isinstance(result, list):
-                    result = result[0]
-                last_region = result["region"]
-                last_scores = result["emotion"]
-                last_dominant = result["dominant_emotion"]
-                emotion_history.append((now, last_dominant))
+            if voice is not None:
+                vread = voice.read()
+                extra["voice_rms"] = vread.get("rms")
+                if pitch_ema is not None:
+                    pitch_ema.update(vread.get("pitch_hz"))
+                    extra["voice_pitch_hz"] = pitch_ema.value
+                else:
+                    extra["voice_pitch_hz"] = vread.get("pitch_hz")
+                extra["voice_pause_rate_min"] = voice.pause_rate_per_min()
 
-                if logging_on and last_region["w"] > 0:
-                    log_row(last_dominant, last_scores, extra)
-            except Exception as e:
-                print(f"[aviso] falha na analise: {e}")
+            extra["gaze_offset"] = gaze_ema.update(gaze_raw) if gaze_ema else gaze_raw
+            extra["shoulder_tilt_deg"] = tilt_ema.update(shoulder_tilt_raw) if tilt_ema else shoulder_tilt_raw
+            extra["lean_proxy"] = lean_proxy
+            extra["hr_bpm"] = (hr_ema.update(hr_raw) if hr_ema else hr_raw) if (hr_raw is not None and hr_reliable) else None
 
-        if last_region and last_region.get("w", 0) > 0:
-            calib_remaining = max(0.0, calib_end_time - now)
-            draw_overlay(
-                frame, last_region, last_dominant, last_scores, logging_on,
-                extra, calibrating, calib_remaining,
-            )
-        else:
-            cv2.putText(
-                frame, "Nenhum rosto detectado", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
-            )
+            sample_kwargs = {k: extra.get(k) for k in SIGNAL_KEYS}
 
-        cv2.imshow("Analise de expressao facial (local, individual)", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("l"):
-            logging_on = not logging_on
-            print(f"Log {'ativado' if logging_on else 'desativado'}.")
-        elif key == ord("c"):
-            write_log_header_now()
-            print("Log limpo.")
-        elif key == ord("b"):
-            if calibrator is None:
-                print("Sinais complementares indisponiveis - instale mediapipe/scipy.")
+            if calibrating:
+                extra["incongruence_score"] = None
+                if stress_ema:
+                    stress_ema.reset()
+                calibrator.add_sample(**sample_kwargs)
+                if now >= calib_end_time:
+                    calibrating = False
+                    ok_calib = calibrator.finalize()
+                    print("Baseline calibrado." if ok_calib else "Calibracao insuficiente, tente 'b' de novo.")
             else:
-                calibrator.reset()
-                calibrating = True
-                calib_end_time = time.time() + CALIBRATION_SECONDS
-                print(f"Calibrando por {CALIBRATION_SECONDS}s - fique parado, expressao neutra.")
+                raw_score = compute_incongruence(calibrator, **sample_kwargs)
+                extra["incongruence_score"] = stress_ema.update(raw_score) if (stress_ema and raw_score is not None) else raw_score
+                if extra["incongruence_score"] is not None:
+                    lbl, _ = stress_label(extra["incongruence_score"])
+                    stress_counts[lbl] += 1
 
-    cap.release()
-    cv2.destroyAllWindows()
-    if face_mesh is not None:
-        face_mesh.close()
-    if pose_tracker is not None:
-        pose_tracker.close()
+            # --- emocao (DeepFace, mais pesado, roda a cada N frames) ---
+            frame_count += 1
+            if frame_count % ANALYZE_EVERY_N_FRAMES == 0:
+                try:
+                    result = DeepFace.analyze(
+                        frame, actions=["emotion"], enforce_detection=False, silent=True
+                    )
+                    if isinstance(result, list):
+                        result = result[0]
+                    last_region = result["region"]
+                    last_scores = result["emotion"]
+                    last_dominant = result["dominant_emotion"]
+                    emotion_counts[last_dominant] += 1
+
+                    if logging_on and last_region["w"] > 0:
+                        log_row(last_dominant, last_scores, extra)
+                except Exception as e:
+                    print(f"[aviso] falha na analise: {e}")
+
+            if last_region and last_region.get("w", 0) > 0:
+                calib_remaining = max(0.0, calib_end_time - now)
+                draw_overlay(
+                    frame, last_region, last_dominant, last_scores, logging_on,
+                    extra, calibrating, calib_remaining,
+                )
+            else:
+                cv2.putText(
+                    frame, "Nenhum rosto detectado", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                )
+
+            cv2.imshow("Analise de expressao facial (local, individual)", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("l"):
+                logging_on = not logging_on
+                print(f"Log {'ativado' if logging_on else 'desativado'}.")
+            elif key == ord("c"):
+                dest = archive_current_log()
+                write_log_header_now()
+                if dest:
+                    print(f"Sessao anterior arquivada em: {dest}")
+                print("Log limpo (pronto pra nova sessao). Use trends.py pra comparar sessoes arquivadas.")
+            elif key == ord("b"):
+                if calibrator is None:
+                    print("Sinais complementares indisponiveis - instale mediapipe/scipy.")
+                else:
+                    calibrator.reset()
+                    calibrating = True
+                    calib_end_time = time.time() + CALIBRATION_SECONDS
+                    print(f"Calibrando por {CALIBRATION_SECONDS}s - fique parado, expressao neutra.")
+    except KeyboardInterrupt:
+        print("\n[aviso] Interrompido com Ctrl+C - prefira apertar 'q' com a janela em foco pra sair.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if face_mesh is not None:
+            face_mesh.close()
+        if pose_tracker is not None:
+            pose_tracker.close()
+        if voice is not None:
+            voice.close()
+        print_session_summary(session_start, emotion_counts, stress_counts)
 
 
 if __name__ == "__main__":

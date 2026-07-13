@@ -1,4 +1,11 @@
-﻿# Created by https://www.toptal.com/developers/gitignore/api/python
+﻿# Dados pessoais de sessao - biometrico/sensivel, nunca deve ir pro
+# repositorio remoto (contradiria o "roda 100% local" do README)
+session_log.csv
+session_archive/
+session_report.png
+trend_report.png
+
+# Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 
 ### Python ###
@@ -37,6 +44,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# main.spec e mantido de proposito (config de build versionada, nao gerado)
+!main.spec
 
 # Installer logs
 pip-log.txt
